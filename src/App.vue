@@ -1,8 +1,17 @@
 <script setup lang="ts">
+import { ref } from 'vue'
 import ComparePanel from './components/ComparePanel.vue'
 import DimensionsPanel from './components/DimensionsPanel.vue'
 import ImageEditorPanel from './components/ImageEditorPanel.vue'
 import TopBar from './components/TopBar.vue'
+
+const savedMaskFile = ref<File | null>(null)
+const savedMaskPreview = ref('')
+
+function handleMaskSaved(payload: { maskUrl: string; file: File }) {
+  savedMaskFile.value = payload.file
+  savedMaskPreview.value = payload.maskUrl
+}
 </script>
 
 <template>
@@ -10,8 +19,11 @@ import TopBar from './components/TopBar.vue'
     <TopBar />
 
     <main class="main-grid">
-      <ImageEditorPanel />
-      <ComparePanel />
+      <ImageEditorPanel @saved="handleMaskSaved" />
+      <ComparePanel
+        :search-file="savedMaskFile"
+        :reference-image="savedMaskPreview"
+      />
     </main>
 
     <DimensionsPanel />

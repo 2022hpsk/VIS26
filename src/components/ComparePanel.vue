@@ -1,40 +1,341 @@
 <script setup lang="ts">
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
+
+type WeightKey = 'structure' | 'color' | 'texture'
+
 interface WeightItem {
+  key: WeightKey
   label: string
   value: number
   tone?: 'pink' | 'mint' | 'blue'
+}
+
+interface SearchItem {
+  path: string
+  is_representative: boolean
+  label: string
+  score: number
+  radius: number
+  angle: number
+}
+
+interface OrbitPoint {
+  x: number
+  y: number
+  raw: SearchItem
+}
+
+interface RepresentativeNode {
+  x: number
+  y: number
+  raw: SearchItem
+  imageUrl: string
 }
 
 interface Props {
   title?: string
   promptPlaceholder?: string
   weights?: WeightItem[]
-  compareImage?: string
   referenceImage?: string
   galleryImages?: string[]
+  searchApiBase?: string
+  searchFile?: File | null
 }
 
 const props = withDefaults(defineProps<Props>(), {
   title: 'Compare',
   promptPlaceholder: 'Describe the style, palette, and mood',
   weights: () => [
-    { label: 'Texture', value: 60, tone: 'pink' },
-    { label: 'Structure', value: 40, tone: 'mint' },
-    { label: 'Color', value: 60, tone: 'blue' }
+    { key: 'structure', label: 'Structure', value: 1, tone: 'mint' },
+    { key: 'color', label: 'Color', value: 0.3, tone: 'blue' },
+    { key: 'texture', label: 'Texture', value: 0.2, tone: 'pink' }
   ],
-  compareImage:
-    'https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=900&q=80',
-  referenceImage:
-    'https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=800&q=80',
-  galleryImages: () => [
-    'https://images.unsplash.com/photo-1474511320723-9a56873867b5?auto=format&fit=crop&w=300&q=80',
-    'https://images.unsplash.com/photo-1452570053594-1b985d6ea890?auto=format&fit=crop&w=300&q=80',
-    'https://images.unsplash.com/photo-1465156799763-2c087c332922?auto=format&fit=crop&w=300&q=80',
-    'https://images.unsplash.com/photo-1470104240373-bc1812eddc9f?auto=format&fit=crop&w=300&q=80',
-    'https://images.unsplash.com/photo-1480044965905-02098d419e96?auto=format&fit=crop&w=300&q=80',
-    'https://images.unsplash.com/photo-1444464666168-49d633b86797?auto=format&fit=crop&w=300&q=80'
-  ]
+  referenceImage: '',
+  galleryImages: () => [],
+  searchApiBase: 'http://127.0.0.1:8001',
+  searchFile: null
 })
+
+const weightRows = ref<WeightItem[]>(
+  props.weights.map((weight) => ({ ...weight, value: clamp(weight.value, 0, 1) }))
+)
+const searchResults = ref<SearchItem[]>([])
+const isSearching = ref(false)
+const searchError = ref('')
+const hoverItem = ref<SearchItem | null>(null)
+const pinnedItem = ref<SearchItem | null>(null)
+const galleryUploads = ref<string[]>([])
+const orbitRef = ref<HTMLDivElement | null>(null)
+const orbitScale = ref(1)
+const orbitOffsetX = ref(0)
+const orbitOffsetY = ref(0)
+const isPanning = ref(false)
+
+let panStartX = 0
+let panStartY = 0
+let panOriginX = 0
+let panOriginY = 0
+
+let debounceTimer: ReturnType<typeof setTimeout> | null = null
+let activeController: AbortController | null = null
+
+const representativeNodes = computed<RepresentativeNode[]>(() =>
+  searchResults.value
+    .filter((item) => item.is_representative)
+    .map((item) => {
+      const point = toOrbitPoint(item)
+      return {
+        ...point,
+        imageUrl: resolveImageUrl(item.path)
+      }
+    })
+)
+
+const MAX_SHADOW_POINTS = 300
+
+const shadowPoints = computed(() => {
+  const members = searchResults.value
+    .filter((item) => !item.is_representative)
+    .map((item) => toOrbitPoint(item))
+
+  if (!members.length) {
+    return []
+  }
+
+  const reps = representativeNodes.value
+  if (!reps.length) {
+    return members.slice(0, MAX_SHADOW_POINTS)
+  }
+
+  const withDistance = members.map((point) => {
+    let nearestDistance = Number.POSITIVE_INFINITY
+    for (const rep of reps) {
+      const dx = point.x - rep.x
+      const dy = point.y - rep.y
+      const dist = dx * dx + dy * dy
+      if (dist < nearestDistance) {
+        nearestDistance = dist
+      }
+    }
+    return {
+      point,
+      nearestDistance
+    }
+  })
+
+  withDistance.sort((a, b) => a.nearestDistance - b.nearestDistance)
+  return withDistance.slice(0, MAX_SHADOW_POINTS).map((item) => item.point)
+})
+
+const activePreviewItem = computed(() => pinnedItem.value ?? hoverItem.value)
+
+const orbitCenterImageUrl = computed(() => props.referenceImage || '')
+
+const displayImageUrl = computed(() => {
+  if (activePreviewItem.value) {
+    return resolveImageUrl(activePreviewItem.value.path)
+  }
+  if (props.referenceImage) return props.referenceImage
+  const first = searchResults.value[0]
+  if (!first) return ''
+  return resolveImageUrl(first.path)
+})
+
+const galleryResultImages = computed(() => galleryUploads.value)
+
+const arcStroke = computed(() => ({
+  structure: String(getWeightValue('structure')),
+  color: String(getWeightValue('color')),
+  texture: String(getWeightValue('texture'))
+}))
+
+const orbitSceneStyle = computed(() => ({
+  transform: `translate(${orbitOffsetX.value}px, ${orbitOffsetY.value}px) scale(${orbitScale.value})`
+}))
+
+watch(
+  () => props.searchFile,
+  (file) => {
+    if (!file) {
+      searchResults.value = []
+      searchError.value = ''
+      hoverItem.value = null
+      pinnedItem.value = null
+      return
+    }
+    queueSearch()
+  },
+  { immediate: true }
+)
+
+onBeforeUnmount(() => {
+  if (debounceTimer) {
+    clearTimeout(debounceTimer)
+  }
+  if (activeController) {
+    activeController.abort()
+  }
+  galleryUploads.value.forEach((url) => URL.revokeObjectURL(url))
+})
+
+function queueSearch() {
+  if (debounceTimer) {
+    clearTimeout(debounceTimer)
+  }
+  debounceTimer = setTimeout(() => {
+    runSearch()
+  }, 300)
+}
+
+function onWeightInput(weight: WeightItem) {
+  weight.value = clamp(weight.value, 0, 1)
+  if (!props.searchFile) return
+  queueSearch()
+}
+
+function onRepresentativeEnter(item: SearchItem) {
+  if (pinnedItem.value) return
+  hoverItem.value = item
+}
+
+function onRepresentativeLeave() {
+  if (pinnedItem.value) return
+  hoverItem.value = null
+}
+
+function onRepresentativeClick(item: SearchItem) {
+  pinnedItem.value = item
+}
+
+function clearPinnedPreview() {
+  pinnedItem.value = null
+  hoverItem.value = null
+}
+
+function addPinnedToGallery() {
+  if (!pinnedItem.value) return
+  galleryUploads.value.unshift(resolveImageUrl(pinnedItem.value.path))
+}
+
+function onOrbitWheel(event: WheelEvent) {
+  if (!orbitRef.value) return
+
+  const factor = event.deltaY < 0 ? 1.1 : 0.9
+  orbitScale.value = clamp(orbitScale.value * factor, 0.6, 3)
+}
+
+function onOrbitMouseDown(event: MouseEvent) {
+  if (event.button !== 0) return
+  isPanning.value = true
+  panStartX = event.clientX
+  panStartY = event.clientY
+  panOriginX = orbitOffsetX.value
+  panOriginY = orbitOffsetY.value
+}
+
+function onOrbitMouseMove(event: MouseEvent) {
+  if (!isPanning.value) return
+  orbitOffsetX.value = panOriginX + (event.clientX - panStartX)
+  orbitOffsetY.value = panOriginY + (event.clientY - panStartY)
+}
+
+function onOrbitMouseUp() {
+  isPanning.value = false
+}
+
+async function runSearch() {
+  if (!props.searchFile) return
+
+  if (activeController) {
+    activeController.abort()
+  }
+
+  const controller = new AbortController()
+  activeController = controller
+  isSearching.value = true
+  searchError.value = ''
+  hoverItem.value = null
+
+  const formData = new FormData()
+  formData.append('file', props.searchFile)
+  formData.append('structure_w', String(getWeightValue('structure')))
+  formData.append('color_w', String(getWeightValue('color')))
+  formData.append('texture_w', String(getWeightValue('texture')))
+  formData.append('nearby_k', '50')
+  formData.append('max_total', '2000')
+
+  try {
+    console.log('Sending search request with weights:', {
+      structure: getWeightValue('structure'),
+      color: getWeightValue('color'),
+      texture: getWeightValue('texture')
+    })
+    const response = await fetch(`${props.searchApiBase}/photo_search`, {
+      method: 'POST',
+      body: formData,
+      signal: controller.signal
+    })
+
+    if (!response.ok) {
+      throw new Error(await response.text())
+    }
+
+    const data = (await response.json()) as SearchItem[]
+    console.log('Search results:', data)
+    searchResults.value = data
+
+    if (pinnedItem.value) {
+      const stillExists = data.some((item) => item.path === pinnedItem.value?.path)
+      if (!stillExists) {
+        pinnedItem.value = null
+      }
+    }
+  } catch (error) {
+    if (controller.signal.aborted) return
+    searchResults.value = []
+    searchError.value = `检索失败：${error instanceof Error ? error.message : '未知错误'}`
+  } finally {
+    if (activeController === controller) {
+      activeController = null
+    }
+    isSearching.value = false
+  }
+}
+
+function getWeightValue(key: WeightKey) {
+  return weightRows.value.find((weight) => weight.key === key)?.value ?? 0
+}
+
+function toOrbitPoint(item: SearchItem): OrbitPoint {
+  const radius = clamp(item.radius, 0, 1) * 44
+  const radian = (item.angle * Math.PI) / 180
+  return {
+    x: 50 + Math.cos(radian) * radius,
+    y: 50 + Math.sin(radian) * radius,
+    raw: item
+  }
+}
+
+function resolveImageUrl(path: string) {
+  if (/^https?:\/\//i.test(path)) {
+    return path
+  }
+
+  let normalized = path.replace(/\\/g, '/')
+  if (normalized.startsWith('./')) {
+    normalized = normalized.slice(1)
+  } else if (normalized.startsWith('data/')) {
+    normalized = `/${normalized}`
+  } else if (!normalized.startsWith('/')) {
+    normalized = `/${normalized}`
+  }
+
+  return `${props.searchApiBase}${normalized}`
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value))
+}
 </script>
 
 <template>
@@ -56,27 +357,25 @@ const props = withDefaults(defineProps<Props>(), {
             </slot>
           </div>
           <div class="weights">
-            <div class="weights-title">Field weights</div>
+            <div class="weights-title">Field weights (0-1)</div>
             <slot name="fieldweights">
               <div class="weights-list">
                 <div
-                  v-for="weight in props.weights"
-                  :key="weight.label"
+                  v-for="weight in weightRows"
+                  :key="weight.key"
                   class="weight-row"
                 >
                   <span>{{ weight.label }}</span>
-                  <div class="weight-track">
-                    <span
-                      class="weight-fill"
-                      :class="{
-                        'is-pink': weight.tone === 'pink',
-                        'is-mint': weight.tone === 'mint',
-                        'is-blue': weight.tone === 'blue'
-                      }"
-                      :style="{ width: `${weight.value}%` }"
-                    ></span>
-                  </div>
-                  <span class="weight-value">{{ weight.value }}%</span>
+                  <input
+                    v-model.number="weight.value"
+                    class="weight-slider"
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.01"
+                    @input="onWeightInput(weight)"
+                  />
+                  <span class="weight-value">{{ weight.value.toFixed(2) }}</span>
                 </div>
               </div>
             </slot>
@@ -86,31 +385,147 @@ const props = withDefaults(defineProps<Props>(), {
 
       <div class="compare-column">
         <slot name="compare">
-          <div class="orbit">
-            <div class="orbit-core">
-              <img :src="props.compareImage" alt="center" />
+          <div
+            ref="orbitRef"
+            class="orbit"
+            @mouseleave="onRepresentativeLeave"
+            @wheel.prevent="onOrbitWheel"
+            @mousedown="onOrbitMouseDown"
+            @mousemove="onOrbitMouseMove"
+            @mouseup="onOrbitMouseUp"
+            @mouseleave.self="onOrbitMouseUp"
+          >
+            <div v-if="!props.searchFile" class="orbit-state">
+              左侧编辑完成后点击“暂存”，自动调用后端生成轨道图
             </div>
-            <div class="orbit-ring ring-1"></div>
-            <div class="orbit-ring ring-2"></div>
-            <div class="orbit-ring ring-3"></div>
-            <div class="orbit-node n1"></div>
-            <div class="orbit-node n2"></div>
-            <div class="orbit-node n3"></div>
-            <div class="orbit-node n4"></div>
-            <div class="orbit-node n5"></div>
-            <div class="orbit-node n6"></div>
-            <div class="orbit-node n7"></div>
-            <div class="orbit-node n8"></div>
+            <div v-else-if="isSearching" class="orbit-state">正在计算轨道图...</div>
+            <div v-else-if="searchError" class="orbit-state orbit-state-error">{{ searchError }}</div>
+            <div v-else-if="!searchResults.length" class="orbit-state">暂无检索结果</div>
+            <div class="orbit-scene" :style="orbitSceneStyle">
+              <svg
+                v-if="searchResults.length"
+                class="orbit-chart"
+                viewBox="0 0 100 100"
+                role="img"
+                aria-label="search orbit"
+              >
+                <circle class="orbit-ring" cx="50" cy="50" r="15" />
+                <circle class="orbit-ring" cx="50" cy="50" r="30" />
+                <circle class="orbit-ring" cx="50" cy="50" r="44" />
+
+                <circle
+                  v-for="(point, index) in shadowPoints"
+                  :key="`${point.raw.path}-${index}`"
+                  class="orbit-shadow"
+                  :cx="point.x"
+                  :cy="point.y"
+                  r="4"
+                />
+              </svg>
+
+              <div v-if="orbitCenterImageUrl" class="orbit-center-image">
+                <img :src="orbitCenterImageUrl" alt="center" />
+              </div>
+
+              <button
+                v-for="(node, index) in representativeNodes"
+                :key="`${node.raw.path}-rep-${index}`"
+                type="button"
+                class="rep-node"
+                :style="{ left: `${node.x}%`, top: `${node.y}%` }"
+                @mousedown.stop
+                @mouseenter="onRepresentativeEnter(node.raw)"
+                @mouseleave="onRepresentativeLeave"
+                @click="onRepresentativeClick(node.raw)"
+              >
+                <svg class="circle-arcs circle-arcs-node" viewBox="0 0 100 100" aria-hidden="true">
+                  <g transform="rotate(-130 50 50)">
+                    <circle
+                      class="weight-arc-track"
+                      cx="50"
+                      cy="50"
+                      r="47"
+                    />
+                    <circle
+                      class="weight-arc arc-structure"
+                      cx="50"
+                      cy="50"
+                      r="47"
+                      pathLength="1"
+                      :stroke-dasharray="`${arcStroke.structure} 1`"
+                    />
+                  </g>
+                  <g transform="rotate(15 50 50)">
+                    <circle
+                      class="weight-arc-track"
+                      cx="50"
+                      cy="50"
+                      r="49"
+                    />
+                    <circle
+                      class="weight-arc arc-color"
+                      cx="50"
+                      cy="50"
+                      r="49"
+                      pathLength="1"
+                      :stroke-dasharray="`${arcStroke.color} 1`"
+                    />
+                  </g>
+                  <g transform="rotate(75 50 50)">
+                    <circle
+                      class="weight-arc-track"
+                      cx="50"
+                      cy="50"
+                      r="51"
+                    />
+                    <circle
+                      class="weight-arc arc-texture"
+                      cx="50"
+                      cy="50"
+                      r="51"
+                      pathLength="1"
+                      :stroke-dasharray="`${arcStroke.texture} 1`"
+                    />
+                  </g>
+                </svg>
+                <img
+                  :src="node.imageUrl"
+                  :alt="node.raw.label"
+                  loading="lazy"
+                  decoding="async"
+                />
+              </button>
+            </div>
+
+            <div v-if="pinnedItem" class="pin-tip">
+              已固定: {{ pinnedItem.label }}
+              <button type="button" class="pin-clear" @click="clearPinnedPreview">取消固定</button>
+            </div>
           </div>
         </slot>
       </div>
 
       <div class="compare-column compare-column-media">
         <div class="panel-block">
-          <div class="panel-subtitle">Image</div>
+          <div class="panel-subtitle-row">
+            <div class="panel-subtitle">Image</div>
+            <button
+              class="upload-icon-btn"
+              type="button"
+              title="加入 Gallery"
+              :disabled="!pinnedItem"
+              @click="addPinnedToGallery"
+            >
+              ⤴
+            </button>
+          </div>
           <slot name="image">
             <div class="hero-image">
-              <img :src="props.referenceImage" alt="reference" />
+              <img v-if="displayImageUrl" :src="displayImageUrl" alt="reference" />
+              <div v-else class="hero-empty">等待左侧保存后的分割图</div>
+            </div>
+            <div v-if="activePreviewItem" class="image-meta">
+              {{ activePreviewItem.label }} · 相似度 {{ activePreviewItem.score.toFixed(4) }}
             </div>
           </slot>
         </div>
@@ -118,8 +533,9 @@ const props = withDefaults(defineProps<Props>(), {
           <div class="panel-subtitle">Gallery</div>
           <slot name="gallery">
             <div class="gallery-grid">
+              <div v-if="!galleryResultImages.length" class="gallery-empty">暂无图片，点击 Image 右上角上传</div>
               <img
-                v-for="(image, index) in props.galleryImages"
+                v-for="(image, index) in galleryResultImages"
                 :key="`${image}-${index}`"
                 :src="image"
                 :alt="`thumb ${index + 1}`"
@@ -151,7 +567,7 @@ const props = withDefaults(defineProps<Props>(), {
 
 .compare-grid {
   display: grid;
-  grid-template-columns: 0.72fr 1.18fr 0.9fr;
+  grid-template-columns: 0.56fr 1.56fr 0.72fr;
   gap: 16px;
   align-items: stretch;
   flex: 1;
@@ -235,41 +651,22 @@ const props = withDefaults(defineProps<Props>(), {
 
 .weight-row {
   display: grid;
-  grid-template-columns: 90px 1fr 40px;
+  grid-template-columns: 72px 1fr 40px;
   align-items: center;
   gap: 12px;
   font-size: 13px;
   margin-top: 8px;
 }
 
-.weight-track {
-  height: 6px;
-  background: #e5ede5;
-  border-radius: 999px;
-  overflow: hidden;
-}
-
-.weight-fill {
-  display: block;
-  height: 100%;
-  border-radius: 999px;
-}
-
-.weight-fill.is-pink {
-  background: var(--accent-pink);
-}
-
-.weight-fill.is-mint {
-  background: var(--accent-mint);
-}
-
-.weight-fill.is-blue {
-  background: var(--accent-blue);
+.weight-slider {
+  width: 100%;
+  accent-color: var(--accent-mint);
 }
 
 .weight-value {
   color: #6d7b73;
   font-weight: 600;
+  text-align: right;
 }
 
 .orbit {
@@ -282,99 +679,150 @@ const props = withDefaults(defineProps<Props>(), {
   overflow: hidden;
 }
 
-.orbit-core {
+.orbit-chart {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.orbit-scene {
   position: absolute;
-  width: 110px;
-  height: 110px;
-  border-radius: 50%;
-  overflow: hidden;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
-  border: 6px solid #ffffff;
-  box-shadow: 0 8px 20px rgba(50, 60, 55, 0.15);
+  inset: 0;
+  transform-origin: 50% 50%;
+  will-change: transform;
 }
 
 .orbit-ring {
+  fill: none;
+  stroke: #dfe6dd;
+  stroke-width: 0.35;
+}
+
+.orbit-shadow {
+  fill: rgba(141, 151, 146, 0.4);
+}
+
+.orbit-state {
   position: absolute;
-  border: 1px solid #e0e6dd;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 0 24px;
+  color: #6c776f;
+  font-size: 13px;
+}
+
+.orbit-state-error {
+  color: #a45448;
+}
+
+.rep-node {
+  position: absolute;
+  width: 44px;
+  height: 44px;
+  transform: translate(-50%, -50%);
   border-radius: 50%;
+  overflow: visible;
+  border: none;
+  box-shadow: none;
+  cursor: pointer;
+  padding: 0;
+  background: transparent;
+}
+
+.orbit-center-image {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 44px;
+  height: 44px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  overflow: visible;
+  border: none;
+  box-shadow: none;
+  background: transparent;
+}
+
+.orbit-center-image img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+}
+
+.rep-node img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+  transform: translateZ(0);
+  backface-visibility: hidden;
+}
+
+.circle-arcs {
+  position: absolute;
   left: 50%;
   top: 50%;
   transform: translate(-50%, -50%);
+  overflow: visible;
+  pointer-events: none;
 }
 
-.ring-1 {
-  width: 180px;
-  height: 180px;
+.circle-arcs-node {
+  width: 48px;
+  height: 48px;
 }
 
-.ring-2 {
-  width: 260px;
-  height: 260px;
+.weight-arc {
+  fill: none;
+  stroke-linecap: round;
 }
 
-.ring-3 {
-  width: 340px;
-  height: 340px;
+.weight-arc-track {
+  fill: none;
+  stroke: rgba(132, 141, 137, 0.28);
+  stroke-width: 0.9;
 }
 
-.orbit-node {
+.arc-structure {
+  stroke: #d88a2e;
+  stroke-width: 0.9;
+}
+
+.arc-color {
+  stroke: #6a67dc;
+  stroke-width: 0.9;
+}
+
+.arc-texture {
+  stroke: #31d6be;
+  stroke-width: 0.9;
+}
+
+.pin-tip {
   position: absolute;
-  width: 52px;
-  height: 52px;
-  border-radius: 50%;
-  border: 4px solid rgba(255, 255, 255, 0.9);
-  background: linear-gradient(135deg, #f8d7d0, #fdebd8);
-  box-shadow: 0 10px 20px rgba(60, 70, 65, 0.12);
+  left: 12px;
+  bottom: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid var(--panel-border);
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: #4b5953;
 }
 
-.orbit-node::after {
-  content: '';
-  position: absolute;
-  inset: 10px;
-  border-radius: 50%;
-  background: linear-gradient(120deg, #d4e8ff, #f2f7ff);
-}
-
-.orbit-node.n1 {
-  left: 18%;
-  top: 18%;
-}
-
-.orbit-node.n2 {
-  left: 65%;
-  top: 12%;
-}
-
-.orbit-node.n3 {
-  left: 80%;
-  top: 45%;
-}
-
-.orbit-node.n4 {
-  left: 65%;
-  top: 70%;
-}
-
-.orbit-node.n5 {
-  left: 30%;
-  top: 72%;
-}
-
-.orbit-node.n6 {
-  left: 12%;
-  top: 50%;
-}
-
-.orbit-node.n7 {
-  left: 45%;
-  top: 8%;
-}
-
-.orbit-node.n8 {
-  left: 48%;
-  top: 78%;
+.pin-clear {
+  border: none;
+  background: transparent;
+  color: var(--accent-blue);
+  font-size: 12px;
+  cursor: pointer;
 }
 
 .panel-block {
@@ -400,16 +848,57 @@ const props = withDefaults(defineProps<Props>(), {
   color: #6a756c;
 }
 
+.panel-subtitle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.upload-icon-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid var(--panel-border);
+  background: #ffffff;
+  color: #4f5c56;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.upload-icon-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .hero-image {
   border-radius: 14px;
   overflow: hidden;
-  height: 160px;
+  height: 148px;
+  border: 1px solid var(--panel-border);
+  background: #f7faf5;
 }
 
 .hero-image img {
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+
+.hero-empty {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #6f7b74;
+  font-size: 12px;
+  text-align: center;
+  padding: 10px;
+}
+
+.image-meta {
+  font-size: 12px;
+  color: #617068;
 }
 
 .gallery-grid {
@@ -421,6 +910,16 @@ const props = withDefaults(defineProps<Props>(), {
   padding-right: 4px;
   padding-bottom: 8px;
   align-content: start;
+}
+
+.gallery-empty {
+  grid-column: 1 / -1;
+  font-size: 12px;
+  color: #6f7b74;
+  text-align: center;
+  padding: 16px 8px;
+  border: 1px dashed var(--panel-border);
+  border-radius: 10px;
 }
 
 .gallery-grid img {
@@ -435,7 +934,7 @@ const props = withDefaults(defineProps<Props>(), {
   }
 
   .orbit {
-    min-height: 220px;
+    min-height: 260px;
   }
 }
 

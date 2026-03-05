@@ -10,7 +10,7 @@ const props = withDefaults(defineProps<Props>(), {
 })
 
 const emit = defineEmits<{
-  saved: [maskUrl: string]
+  saved: [payload: { maskUrl: string; file: File }]
 }>()
 
 const fileInputRef = ref<HTMLInputElement | null>(null)
@@ -364,9 +364,14 @@ function saveCurrentMask() {
     return
   }
 
+  const fileName = `edited-mask-${Date.now()}.png`
+  const savedFile = new File([currentMaskBlob.value], fileName, { type: 'image/png' })
   const savedUrl = URL.createObjectURL(currentMaskBlob.value)
   savedMasks.value.push(savedUrl)
-  emit('saved', savedUrl)
+  emit('saved', {
+    maskUrl: savedUrl,
+    file: savedFile
+  })
   statusText.value = `已暂存到前端，共 ${savedMasks.value.length} 份结果`
 }
 
