@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 type WeightKey = 'structure' | 'color' | 'texture'
 
@@ -70,6 +70,7 @@ const orbitScale = ref(1)
 const orbitOffsetX = ref(0)
 const orbitOffsetY = ref(0)
 const isPanning = ref(false)
+const shadowRadius = ref(4)
 
 let panStartX = 0
 let panStartY = 0
@@ -78,17 +79,106 @@ let panOriginY = 0
 
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
 let activeController: AbortController | null = null
+let orbitResizeObserver: ResizeObserver | null = null
+
+function updateShadowRadius() {
+  if (!orbitRef.value) return
+  const size = Math.min(orbitRef.value.clientWidth, orbitRef.value.clientHeight)
+  if (size <= 0) return
+
+  // 代表圈直径是 44px，这里将其换算为 viewBox(0-100) 的半径单位。
+  const r = (22 * 100) / size
+  shadowRadius.value = clamp(r, 1.5, 10)
+}
+
+function spreadRepresentativeNodes(nodes: RepresentativeNode[]) {
+  if (nodes.length < 2) return nodes
+
+  // 只处理严重拥挤，不追求等距分布。
+  const collisionDist = 6.2
+  const left = 6
+  const right = 94
+  const top = 6
+  const bottom = 94
+  const iterations = 10
+  const maxShift = 4.5
+
+  const original = nodes.map((node) => ({ x: node.x, y: node.y }))
+  const pos = nodes.map((node) => ({ x: node.x, y: node.y }))
+
+  for (let iter = 0; iter < iterations; iter += 1) {
+    for (let i = 0; i < pos.length; i += 1) {
+      const pi = pos[i]!
+      for (let j = i + 1; j < pos.length; j += 1) {
+        const pj = pos[j]!
+        const dx = pj.x - pi.x
+        const dy = pj.y - pi.y
+        const d2 = dx * dx + dy * dy
+
+        if (d2 >= collisionDist * collisionDist) continue
+
+        let dist = Math.sqrt(d2)
+        if (dist < 1e-6) {
+          const jitter = ((i + 1) * (j + 3)) % 7
+          dist = 0.001
+          pj.x += (jitter - 3) * 0.12
+          pj.y += (3 - jitter) * 0.12
+        }
+
+        // 推开量只覆盖“重叠部分”，并故意保守，避免排成均匀圆环。
+        const overlap = collisionDist - dist
+        const softness = 0.35 + 0.35 * (iter / Math.max(1, iterations - 1))
+        const pushX = (dx / dist) * overlap * softness * 0.5
+        const pushY = (dy / dist) * overlap * softness * 0.5
+
+        pi.x -= pushX
+        pi.y -= pushY
+        pj.x += pushX
+        pj.y += pushY
+      }
+    }
+
+    // 轻微回弹，保持整体布局语义不被过度破坏。
+    for (let i = 0; i < pos.length; i += 1) {
+      const pi = pos[i]!
+      const oi = original[i]!
+      // 强回弹：尽量贴近后端原始位置，只做局部冲突修复。
+      pi.x += (oi.x - pi.x) * 0.24
+      pi.y += (oi.y - pi.y) * 0.24
+
+      const offX = pi.x - oi.x
+      const offY = pi.y - oi.y
+      const offLen = Math.sqrt(offX * offX + offY * offY)
+      if (offLen > maxShift) {
+        const k = maxShift / offLen
+        pi.x = oi.x + offX * k
+        pi.y = oi.y + offY * k
+      }
+
+      pi.x = clamp(pi.x, left, right)
+      pi.y = clamp(pi.y, top, bottom)
+    }
+  }
+
+  return nodes.map((node, idx) => ({
+    ...node,
+    x: pos[idx]!.x,
+    y: pos[idx]!.y
+  }))
+}
 
 const representativeNodes = computed<RepresentativeNode[]>(() =>
-  searchResults.value
-    .filter((item) => item.is_representative)
-    .map((item) => {
-      const point = toOrbitPoint(item)
-      return {
-        ...point,
-        imageUrl: resolveImageUrl(item.path)
-      }
-    })
+  spreadRepresentativeNodes(
+    searchResults.value
+      .filter((item) => item.is_representative)
+      .map((item) => {
+        const point = toOrbitPoint(item)
+        return {
+          ...point,
+          imageUrl: resolveImageUrl(item.path)
+        }
+      })
+  )
 )
 
 const MAX_SHADOW_POINTS = 300
@@ -175,7 +265,21 @@ onBeforeUnmount(() => {
   if (activeController) {
     activeController.abort()
   }
+  if (orbitResizeObserver) {
+    orbitResizeObserver.disconnect()
+    orbitResizeObserver = null
+  }
   galleryUploads.value.forEach((url) => URL.revokeObjectURL(url))
+})
+
+onMounted(() => {
+  updateShadowRadius()
+  if (orbitRef.value) {
+    orbitResizeObserver = new ResizeObserver(() => {
+      updateShadowRadius()
+    })
+    orbitResizeObserver.observe(orbitRef.value)
+  }
 })
 
 function queueSearch() {
@@ -307,7 +411,9 @@ function getWeightValue(key: WeightKey) {
 }
 
 function toOrbitPoint(item: SearchItem): OrbitPoint {
-  const radius = clamp(item.radius, 0, 1) * 44
+  // 指数式放大：越外层扩张越明显，呈现等比扩大的视觉感受。
+  const rawRadius = Math.max(0, item.radius)
+  const radius = Math.expm1(rawRadius * 1.5) * 36
   const radian = (item.angle * Math.PI) / 180
   return {
     x: 50 + Math.cos(radian) * radius,
@@ -321,16 +427,30 @@ function resolveImageUrl(path: string) {
     return path
   }
 
+  const base = props.searchApiBase.replace(/\/$/, '')
   let normalized = path.replace(/\\/g, '/')
-  if (normalized.startsWith('./')) {
+
+  // 兼容绝对磁盘路径，优先截取 /data/... 段用于后端静态映射。
+  const dataIdx = normalized.indexOf('/data/')
+  if (dataIdx >= 0) {
+    normalized = normalized.slice(dataIdx)
+  } else if (normalized.startsWith('./data/')) {
     normalized = normalized.slice(1)
   } else if (normalized.startsWith('data/')) {
     normalized = `/${normalized}`
+  } else if (normalized.startsWith('./')) {
+    normalized = normalized.slice(1)
   } else if (!normalized.startsWith('/')) {
     normalized = `/${normalized}`
   }
 
-  return `${props.searchApiBase}${normalized}`
+  // 编码中文与空格等字符，避免部分图片 404。
+  const encodedPath = normalized
+    .split('/')
+    .map((segment, idx) => (idx === 0 ? segment : encodeURIComponent(segment)))
+    .join('/')
+
+  return `${base}${encodedPath}`
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -419,7 +539,7 @@ function clamp(value: number, min: number, max: number) {
                   class="orbit-shadow"
                   :cx="point.x"
                   :cy="point.y"
-                  r="4"
+                  :r="shadowRadius"
                 />
               </svg>
 

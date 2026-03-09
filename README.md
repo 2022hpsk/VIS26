@@ -1,5 +1,6 @@
-
 运行步骤说明：
+    cd P2P-AVA/frontend
+
     npm install
 
     npm run dev
