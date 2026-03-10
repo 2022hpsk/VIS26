@@ -23,6 +23,7 @@ function handleMaskSaved(payload: { maskUrl: string; file: File }) {
       <ComparePanel
         :search-file="savedMaskFile"
         :reference-image="savedMaskPreview"
+        controls-target="#compare-controls-host"
       />
     </main>
 
@@ -44,7 +45,7 @@ function handleMaskSaved(payload: { maskUrl: string; file: File }) {
 
 .main-grid {
   display: grid;
-  grid-template-columns: minmax(0, 35fr) minmax(0, 65fr);
+  grid-template-columns: minmax(0, 46fr) minmax(0, 54fr);
   aspect-ratio: 6 / 5;
   width: 100%;
   max-height: 100%;

@@ -39,6 +39,8 @@ interface Props {
   referenceImage?: string
   galleryImages?: string[]
   searchApiBase?: string
+  promptApiBase?: string
+  controlsTarget?: string
   searchFile?: File | null
 }
 
@@ -53,6 +55,8 @@ const props = withDefaults(defineProps<Props>(), {
   referenceImage: '',
   galleryImages: () => [],
   searchApiBase: 'http://127.0.0.1:8001',
+  promptApiBase: 'http://127.0.0.1:8000',
+  controlsTarget: '',
   searchFile: null
 })
 
@@ -61,7 +65,10 @@ const weightRows = ref<WeightItem[]>(
 )
 const searchResults = ref<SearchItem[]>([])
 const isSearching = ref(false)
+const isPromptLoading = ref(false)
 const searchError = ref('')
+const promptError = ref('')
+const promptText = ref('')
 const hoverItem = ref<SearchItem | null>(null)
 const pinnedItem = ref<SearchItem | null>(null)
 const galleryUploads = ref<string[]>([])
@@ -80,6 +87,7 @@ let panOriginY = 0
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
 let activeController: AbortController | null = null
 let orbitResizeObserver: ResizeObserver | null = null
+let controlsHostProbeTimer: ReturnType<typeof setInterval> | null = null
 
 function updateShadowRadius() {
   if (!orbitRef.value) return
@@ -243,6 +251,21 @@ const orbitSceneStyle = computed(() => ({
   transform: `translate(${orbitOffsetX.value}px, ${orbitOffsetY.value}px) scale(${orbitScale.value})`
 }))
 
+const controlsHostEl = ref<HTMLElement | null>(null)
+
+function syncControlsHostReady() {
+  const target = props.controlsTarget?.trim()
+  if (!target || typeof document === 'undefined') {
+    controlsHostEl.value = null
+    return
+  }
+  controlsHostEl.value = document.querySelector(target) as HTMLElement | null
+}
+
+const useExternalControls = computed(() =>
+  Boolean(props.controlsTarget && props.controlsTarget.trim() && controlsHostEl.value)
+)
+
 watch(
   () => props.searchFile,
   (file) => {
@@ -269,10 +292,27 @@ onBeforeUnmount(() => {
     orbitResizeObserver.disconnect()
     orbitResizeObserver = null
   }
+  if (controlsHostProbeTimer) {
+    clearInterval(controlsHostProbeTimer)
+    controlsHostProbeTimer = null
+  }
   galleryUploads.value.forEach((url) => URL.revokeObjectURL(url))
 })
 
 onMounted(() => {
+  syncControlsHostReady()
+  // 某些情况下 Teleport 目标会晚于当前组件挂载，轮询短暂探测确保命中。
+  requestAnimationFrame(() => {
+    syncControlsHostReady()
+  })
+  controlsHostProbeTimer = setInterval(() => {
+    syncControlsHostReady()
+    if (controlsHostEl.value && controlsHostProbeTimer) {
+      clearInterval(controlsHostProbeTimer)
+      controlsHostProbeTimer = null
+    }
+  }, 250)
+
   updateShadowRadius()
   if (orbitRef.value) {
     orbitResizeObserver = new ResizeObserver(() => {
@@ -281,6 +321,22 @@ onMounted(() => {
     orbitResizeObserver.observe(orbitRef.value)
   }
 })
+
+watch(
+  () => props.controlsTarget,
+  () => {
+    syncControlsHostReady()
+    if (!controlsHostEl.value && !controlsHostProbeTimer) {
+      controlsHostProbeTimer = setInterval(() => {
+        syncControlsHostReady()
+        if (controlsHostEl.value && controlsHostProbeTimer) {
+          clearInterval(controlsHostProbeTimer)
+          controlsHostProbeTimer = null
+        }
+      }, 250)
+    }
+  }
+)
 
 function queueSearch() {
   if (debounceTimer) {
@@ -295,6 +351,55 @@ function onWeightInput(weight: WeightItem) {
   weight.value = clamp(weight.value, 0, 1)
   if (!props.searchFile) return
   queueSearch()
+}
+
+async function submitPromptForWeights() {
+  const prompt = promptText.value.trim()
+  if (!prompt || isPromptLoading.value) return
+
+  isPromptLoading.value = true
+  promptError.value = ''
+
+  try {
+    const response = await fetch(`${props.promptApiBase}/prompt_weights`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt })
+    })
+
+    if (!response.ok) {
+      throw new Error(await response.text())
+    }
+
+    const data = (await response.json()) as {
+      structure: number
+      color: number
+      texture: number
+    }
+
+    applyPromptWeights(data)
+  } catch (error) {
+    promptError.value = `权重生成失败：${error instanceof Error ? error.message : '未知错误'}`
+  } finally {
+    isPromptLoading.value = false
+  }
+}
+
+function applyPromptWeights(weights: { structure: number; color: number; texture: number }) {
+  const nextValues: Record<WeightKey, number> = {
+    structure: clamp(Number(weights.structure), 0, 1),
+    color: clamp(Number(weights.color), 0, 1),
+    texture: clamp(Number(weights.texture), 0, 1)
+  }
+
+  weightRows.value = weightRows.value.map((weight) => ({
+    ...weight,
+    value: nextValues[weight.key]
+  }))
+
+  if (props.searchFile) {
+    queueSearch()
+  }
 }
 
 function onRepresentativeEnter(item: SearchItem) {
@@ -460,8 +565,8 @@ function clamp(value: number, min: number, max: number) {
 
 <template>
   <section class="panel panel-compare">
-    <div class="compare-grid">
-      <div class="compare-column compare-column-controls">
+    <Teleport v-if="useExternalControls" :to="controlsHostEl!">
+      <div class="teleported-controls">
         <div class="prompt-card">
           <div class="prompt-header">
             <span class="prompt-search-icon" aria-hidden="true">🔍</span>
@@ -469,13 +574,81 @@ function clamp(value: number, min: number, max: number) {
           </div>
           <div class="prompt-input">
             <slot name="prompt">
+              <div class="prompt-input-wrap">
               <textarea
+                v-model="promptText"
                 :placeholder="props.promptPlaceholder"
                 aria-label="prompt"
                 rows="4"
               ></textarea>
+                <button
+                  class="prompt-send-btn"
+                  type="button"
+                  :disabled="isPromptLoading || !promptText.trim()"
+                  @click="submitPromptForWeights"
+                >
+                  {{ isPromptLoading ? '...' : '➤' }}
+                </button>
+              </div>
             </slot>
           </div>
+          <div v-if="promptError" class="prompt-error">{{ promptError }}</div>
+          <div class="weights">
+            <div class="weights-title">Field weights (0-1)</div>
+            <slot name="fieldweights">
+              <div class="weights-list">
+                <div
+                  v-for="weight in weightRows"
+                  :key="weight.key"
+                  class="weight-row"
+                >
+                  <span>{{ weight.label }}</span>
+                  <input
+                    v-model.number="weight.value"
+                    class="weight-slider"
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.01"
+                    @input="onWeightInput(weight)"
+                  />
+                  <span class="weight-value">{{ weight.value.toFixed(2) }}</span>
+                </div>
+              </div>
+            </slot>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <div class="compare-grid" :class="{ 'compare-grid--no-controls': useExternalControls }">
+      <div v-if="!useExternalControls" class="compare-column compare-column-controls">
+        <div class="prompt-card">
+          <div class="prompt-header">
+            <span class="prompt-search-icon" aria-hidden="true">🔍</span>
+            <span class="prompt-title">Prompt</span>
+          </div>
+          <div class="prompt-input">
+            <slot name="prompt">
+              <div class="prompt-input-wrap">
+              <textarea
+                v-model="promptText"
+                :placeholder="props.promptPlaceholder"
+                aria-label="prompt"
+                rows="4"
+              ></textarea>
+                <button
+                  class="prompt-send-btn"
+                  type="button"
+                  :disabled="isPromptLoading || !promptText.trim()"
+                  @click="submitPromptForWeights"
+                >
+                  {{ isPromptLoading ? '...' : '➤' }}
+                </button>
+              </div>
+            </slot>
+          </div>
+          <div v-if="promptError" class="prompt-error">{{ promptError }}</div>
           <div class="weights">
             <div class="weights-title">Field weights (0-1)</div>
             <slot name="fieldweights">
@@ -694,6 +867,15 @@ function clamp(value: number, min: number, max: number) {
   min-height: 0;
 }
 
+.compare-grid--no-controls {
+  grid-template-columns: 1.56fr 0.72fr;
+}
+
+.teleported-controls {
+  height: 100%;
+  min-height: 0;
+}
+
 .compare-column {
   display: flex;
   flex-direction: column;
@@ -749,6 +931,37 @@ function clamp(value: number, min: number, max: number) {
   resize: none;
   min-height: 5.6em;
   font-family: inherit;
+}
+
+.prompt-input-wrap {
+  position: relative;
+}
+
+.prompt-input-wrap textarea {
+  padding-right: 38px;
+}
+
+.prompt-send-btn {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: #ffffff;
+  color: #4f5c56;
+  cursor: pointer;
+}
+
+.prompt-send-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.prompt-error {
+  font-size: 12px;
+  color: #a45448;
 }
 
 .weights-title {
